@@ -14,7 +14,12 @@ from advanced_kriging import evaluate_regression_kriging_on_masks
 from asmx import DEFAULT_ASM_PARAMS, METERS_PER_MILE, evaluate_asm_on_masks
 from kriging import evaluate_spatial_ordinary_kriging_on_masks
 from knn import evaluate_spatiotemporal_knn_on_masks
-from methods import apply_row_masks, generate_masked_row_arrays
+from methods import (
+    apply_row_masks,
+    find_common_fully_observed_rows,
+    generate_masked_row_arrays,
+    generate_row_mask_indices,
+)
 
 
 I24_REPAIRED_MATRIX_DIR = "data/i24/matrix_sweeps/daily_combined_repaired"
@@ -154,10 +159,33 @@ def load_i24_experiment_manifest(
     }
 
     rows = []
+    repaired_manifest_path = input_path / "repaired_manifest.csv"
+    repaired_manifest = None
+    if any(metric in {"flow", "density"} for metric in metrics):
+        if not repaired_manifest_path.exists():
+            raise FileNotFoundError(
+                f"Missing repaired manifest for flow/density metrics: "
+                f"'{repaired_manifest_path}'."
+            )
+        repaired_manifest = pd.read_csv(repaired_manifest_path)
+
     for metric in metrics:
+        if metric in {"flow", "density"}:
+            metric_rows = repaired_manifest[repaired_manifest["metric"] == metric]
+            for _, record in metric_rows.iterrows():
+                metadata = parse_i24_matrix_metadata(record["output_path"])
+                rows.append(
+                    {
+                        **metadata,
+                        "shape": record.get("repaired_shape"),
+                    }
+                )
+            continue
+
         if metric not in manifest_specs:
             raise ValueError(
-                f"Unsupported metric '{metric}'. Expected one of {sorted(manifest_specs)}."
+                f"Unsupported metric '{metric}'. Expected one of "
+                f"{sorted([*manifest_specs, 'density', 'flow'])}."
             )
 
         manifest_name, path_column = manifest_specs[metric]
@@ -191,8 +219,9 @@ def build_i24_mask_index_map(
     """
     Precompute reusable row-mask index sets keyed by matrix path.
 
-    Reuse this mapping across methods when you want visual or metric comparisons
-    to use the exact same masked rows.
+    Masks are generated once per `(day, direction, start, end, dt, dx)` group and
+    assigned to every requested metric in that group. This keeps the hidden rows
+    aligned across flow, density, velocity, and flow-per-lane matrices.
     """
     manifest = load_i24_experiment_manifest(metrics=metrics, input_dir=input_dir)
     if day_names is not None:
@@ -206,18 +235,36 @@ def build_i24_mask_index_map(
     generator = rng if isinstance(rng, np.random.Generator) else np.random.default_rng(rng)
     mask_indices_by_file: dict[str, list[np.ndarray]] = {}
 
-    for _, row in manifest.iterrows():
-        matrix = np.load(row["matrix_path"])
-        masked_matrices = generate_masked_row_arrays(
-            matrix=matrix,
-            resolution=int(row["dx_meters"]),
+    group_columns = [
+        "day",
+        "direction",
+        "start_label",
+        "end_label",
+        "dt",
+        "dx_meters",
+    ]
+    for _, group in manifest.groupby(group_columns, sort=False):
+        matrices = [np.load(path) for path in group["matrix_path"]]
+        first_shape = matrices[0].shape
+        if any(matrix.shape != first_shape for matrix in matrices):
+            shapes = {
+                Path(path).name: matrix.shape
+                for path, matrix in zip(group["matrix_path"], matrices, strict=True)
+            }
+            raise ValueError(f"Metric matrix shape mismatch within mask group: {shapes}.")
+
+        eligible_rows = find_common_fully_observed_rows(matrices)
+        shared_mask_indices = generate_row_mask_indices(
+            num_rows=first_shape[0],
+            resolution=int(group.iloc[0]["dx_meters"]),
+            eligible_rows=eligible_rows,
             num_masks=num_masks,
             rng=generator,
         )
-        mask_indices_by_file[row["matrix_path"]] = [
-            np.flatnonzero(np.isnan(masked).all(axis=1)).astype(int, copy=False)
-            for masked in masked_matrices
-        ]
+        for matrix_path in group["matrix_path"]:
+            mask_indices_by_file[matrix_path] = [
+                rows.astype(int, copy=False) for rows in shared_mask_indices
+            ]
 
     return mask_indices_by_file
 
@@ -391,6 +438,17 @@ def run_i24_imputation_experiment(
     imputed_dir.mkdir(parents=True, exist_ok=True)
 
     generator = rng if isinstance(rng, np.random.Generator) else np.random.default_rng(rng)
+    if mask_indices_by_file is None:
+        mask_indices_by_file = build_i24_mask_index_map(
+            metrics=metrics,
+            day_names=day_names,
+            dt_values=dt_values,
+            dx_values=dx_values,
+            input_dir=input_dir,
+            num_masks=num_masks,
+            rng=generator,
+        )
+
     raw_rows: list[dict[str, Any]] = []
     artifact_rows: list[dict[str, Any]] = []
 
@@ -398,7 +456,7 @@ def run_i24_imputation_experiment(
         matrix_path = manifest_row["matrix_path"]
         ground_truth = np.load(matrix_path)
 
-        if mask_indices_by_file is not None and matrix_path in mask_indices_by_file:
+        if matrix_path in mask_indices_by_file:
             masked_matrices = apply_row_masks(
                 matrix=ground_truth,
                 mask_indices=mask_indices_by_file[matrix_path],
