@@ -1,0 +1,3 @@
+[submodule "metanet_calibration"]
+	path = metanet_calibration
+	url = https://github.com/woxsao/metanet-calibration.git
