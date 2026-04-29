@@ -12,17 +12,19 @@ import pandas as pd
 
 from advanced_kriging import evaluate_regression_kriging_on_masks
 from asmx import DEFAULT_ASM_PARAMS, METERS_PER_MILE, evaluate_asm_on_masks
+from gnn_kriging import evaluate_gnn_kriging_on_masks
 from kriging import evaluate_spatial_ordinary_kriging_on_masks
 from knn import evaluate_spatiotemporal_knn_on_masks
+from metanet_imputation import evaluate_metanet_on_masks
 from methods import (
+    ROW_MASK_FRACTIONS_BY_RESOLUTION,
+    _normalize_resolution,
     apply_row_masks,
-    find_common_fully_observed_rows,
-    generate_masked_row_arrays,
-    generate_row_mask_indices,
 )
 
 
 I24_REPAIRED_MATRIX_DIR = "data/i24/matrix_sweeps/daily_combined_repaired"
+DEFAULT_I24_MASK_INDEX_PATH = "results/masks/i24_row_mask_indices.pkl"
 I24_MATRIX_STEM_PATTERN = re.compile(
     r"^(?P<day>[a-z0-9]+)_(?P<direction>[a-z]+)_(?P<start>\d+)_(?P<end>\d+)"
     r"_dt_(?P<dt>[^_]+)_dx_(?P<dx_meters>\d+)m_(?P<metric>[a-z_]+)$"
@@ -207,21 +209,90 @@ def load_i24_experiment_manifest(
     ).reset_index(drop=True)
 
 
-def build_i24_mask_index_map(
+def _coerce_resolution_mask_map(
+    mask_data: Any,
+) -> dict[int, list[np.ndarray]]:
+    """Normalize supported saved-mask payloads to `{dx_meters: [row arrays]}`."""
+    if isinstance(mask_data, dict) and "masks_by_dx" in mask_data:
+        raw_masks = mask_data["masks_by_dx"]
+    else:
+        raw_masks = mask_data
+
+    if not isinstance(raw_masks, dict):
+        raise TypeError("Saved mask data must be a dictionary keyed by spatial resolution.")
+
+    masks_by_dx: dict[int, list[np.ndarray]] = {}
+    for raw_dx, raw_mask_list in raw_masks.items():
+        dx_meters = _normalize_resolution(raw_dx)
+        if dx_meters not in ROW_MASK_FRACTIONS_BY_RESOLUTION:
+            raise ValueError(
+                f"Unsupported mask resolution {raw_dx!r}. Expected one of "
+                f"{sorted(ROW_MASK_FRACTIONS_BY_RESOLUTION)} meters."
+            )
+        if not isinstance(raw_mask_list, (list, tuple)):
+            raise TypeError(f"Masks for {dx_meters}m must be a list of row-index arrays.")
+        masks_by_dx[dx_meters] = [
+            np.asarray(mask_rows, dtype=int) for mask_rows in raw_mask_list
+        ]
+
+    return masks_by_dx
+
+
+def _validate_predefined_masks_for_manifest(
+    masks_by_dx: dict[int, list[np.ndarray]],
+    manifest: pd.DataFrame,
+) -> None:
+    """Validate saved row masks against the current I-24 matrix shapes."""
+    for dx_meters, group in manifest.groupby("dx_meters", sort=False):
+        dx_meters = int(dx_meters)
+        if dx_meters not in masks_by_dx:
+            raise ValueError(f"Saved mask map is missing {dx_meters}m masks.")
+
+        row_counts = set()
+        for shape in group["shape"]:
+            row_count = int(str(shape).split("x", maxsplit=1)[0])
+            row_counts.add(row_count)
+        if len(row_counts) != 1:
+            raise ValueError(f"Expected one row count for {dx_meters}m; got {row_counts}.")
+
+        num_rows = row_counts.pop()
+        expected_masked_rows = int(
+            round(num_rows * ROW_MASK_FRACTIONS_BY_RESOLUTION[dx_meters])
+        )
+        mask_list = masks_by_dx[dx_meters]
+        if len(mask_list) != 5:
+            raise ValueError(f"Expected 5 saved masks for {dx_meters}m; got {len(mask_list)}.")
+
+        for mask_index, mask_rows in enumerate(mask_list):
+            if mask_rows.ndim != 1:
+                raise ValueError(f"{dx_meters}m mask {mask_index} must be one-dimensional.")
+            if mask_rows.size != expected_masked_rows:
+                raise ValueError(
+                    f"{dx_meters}m mask {mask_index} has {mask_rows.size} rows; "
+                    f"expected {expected_masked_rows} from the configured sparsity ratio."
+                )
+            if np.unique(mask_rows).size != mask_rows.size:
+                raise ValueError(f"{dx_meters}m mask {mask_index} contains duplicate rows.")
+            if mask_rows.size and (mask_rows.min() <= 0 or mask_rows.max() >= num_rows - 1):
+                raise ValueError(
+                    f"{dx_meters}m mask {mask_index} includes a boundary row. "
+                    "The first and last spatial segments must remain observed."
+                )
+
+
+def expand_i24_predefined_mask_index_map(
+    masks_by_dx: dict[int, list[np.ndarray]],
     metrics: tuple[str, ...] = ("velocity", "flow_per_lane"),
     day_names: tuple[str, ...] | None = None,
     dt_values: tuple[str, ...] | None = None,
     dx_values: tuple[int, ...] | None = None,
     input_dir: str = I24_REPAIRED_MATRIX_DIR,
-    num_masks: int = 5,
-    rng: np.random.Generator | int | None = None,
 ) -> dict[str, list[np.ndarray]]:
     """
-    Precompute reusable row-mask index sets keyed by matrix path.
+    Expand saved resolution-level masks to the path-keyed map used by evaluators.
 
-    Masks are generated once per `(day, direction, start, end, dt, dx)` group and
-    assigned to every requested metric in that group. This keeps the hidden rows
-    aligned across flow, density, velocity, and flow-per-lane matrices.
+    The same five masks for each spatial resolution are applied to every day,
+    temporal resolution, and metric in the selected manifest.
     """
     manifest = load_i24_experiment_manifest(metrics=metrics, input_dir=input_dir)
     if day_names is not None:
@@ -232,41 +303,74 @@ def build_i24_mask_index_map(
         manifest = manifest[manifest["dx_meters"].isin(dx_values)]
     manifest = manifest.reset_index(drop=True)
 
-    generator = rng if isinstance(rng, np.random.Generator) else np.random.default_rng(rng)
-    mask_indices_by_file: dict[str, list[np.ndarray]] = {}
+    _validate_predefined_masks_for_manifest(masks_by_dx, manifest)
+    return {
+        str(row["matrix_path"]): [
+            mask_rows.astype(int, copy=False)
+            for mask_rows in masks_by_dx[int(row["dx_meters"])]
+        ]
+        for _, row in manifest.iterrows()
+    }
 
-    group_columns = [
-        "day",
-        "direction",
-        "start_label",
-        "end_label",
-        "dt",
-        "dx_meters",
+
+def build_i24_mask_index_map(
+    metrics: tuple[str, ...] = ("velocity", "flow_per_lane"),
+    day_names: tuple[str, ...] | None = None,
+    dt_values: tuple[str, ...] | None = None,
+    dx_values: tuple[int, ...] | None = None,
+    input_dir: str = I24_REPAIRED_MATRIX_DIR,
+    mask_path: str | Path = DEFAULT_I24_MASK_INDEX_PATH,
+) -> dict[str, list[np.ndarray]]:
+    """
+    Load predefined row masks and return them keyed by matrix path.
+
+    This function no longer generates masks. The saved mask artifact is the
+    single source of truth, with one set of five masks per spatial resolution.
+    """
+    masks_by_dx = _coerce_resolution_mask_map(load_mask_index_map(mask_path))
+    return expand_i24_predefined_mask_index_map(
+        masks_by_dx=masks_by_dx,
+        metrics=metrics,
+        day_names=day_names,
+        dt_values=dt_values,
+        dx_values=dx_values,
+        input_dir=input_dir,
+    )
+
+
+def _find_i24_metric_matrix_path(
+    manifest_row: pd.Series,
+    *,
+    metric: str,
+    input_dir: str = I24_REPAIRED_MATRIX_DIR,
+) -> str:
+    """Return the repaired matrix path for another metric in the same I-24 case."""
+    current_metric = str(manifest_row["metric"])
+    if current_metric == metric:
+        return str(manifest_row["matrix_path"])
+
+    current_path = Path(str(manifest_row["matrix_path"]))
+    candidate = current_path.with_name(
+        current_path.name.replace(f"_{current_metric}.npy", f"_{metric}.npy")
+    )
+    if candidate.exists():
+        return str(candidate)
+
+    manifest = load_i24_experiment_manifest(metrics=(metric,), input_dir=input_dir)
+    match = manifest[
+        (manifest["day"] == manifest_row["day"])
+        & (manifest["direction"] == manifest_row["direction"])
+        & (manifest["start_label"] == manifest_row["start_label"])
+        & (manifest["end_label"] == manifest_row["end_label"])
+        & (manifest["dt"] == manifest_row["dt"])
+        & (manifest["dx_meters"].astype(int) == int(manifest_row["dx_meters"]))
     ]
-    for _, group in manifest.groupby(group_columns, sort=False):
-        matrices = [np.load(path) for path in group["matrix_path"]]
-        first_shape = matrices[0].shape
-        if any(matrix.shape != first_shape for matrix in matrices):
-            shapes = {
-                Path(path).name: matrix.shape
-                for path, matrix in zip(group["matrix_path"], matrices, strict=True)
-            }
-            raise ValueError(f"Metric matrix shape mismatch within mask group: {shapes}.")
-
-        eligible_rows = find_common_fully_observed_rows(matrices)
-        shared_mask_indices = generate_row_mask_indices(
-            num_rows=first_shape[0],
-            resolution=int(group.iloc[0]["dx_meters"]),
-            eligible_rows=eligible_rows,
-            num_masks=num_masks,
-            rng=generator,
+    if match.empty:
+        raise FileNotFoundError(
+            f"Could not find companion {metric} matrix for "
+            f"{manifest_row['file']}."
         )
-        for matrix_path in group["matrix_path"]:
-            mask_indices_by_file[matrix_path] = [
-                rows.astype(int, copy=False) for rows in shared_mask_indices
-            ]
-
-    return mask_indices_by_file
+    return str(match.iloc[0]["matrix_path"])
 
 
 def save_mask_index_map(
@@ -399,10 +503,10 @@ def run_i24_imputation_experiment(
     dx_values: tuple[int, ...] | None = None,
     input_dir: str = I24_REPAIRED_MATRIX_DIR,
     results_root: str = "results",
-    num_masks: int = 5,
     artifact_mask_index: int = 0,
-    rng: np.random.Generator | int | None = None,
     mask_indices_by_file: dict[str, list[np.ndarray]] | None = None,
+    mask_path: str | Path = DEFAULT_I24_MASK_INDEX_PATH,
+    mask_indices_to_run: tuple[int, ...] | list[int] | None = None,
 ) -> dict[str, pd.DataFrame]:
     """
     Run an imputation experiment across the repaired I-24 matrix sweep.
@@ -415,10 +519,18 @@ def run_i24_imputation_experiment(
     It must return `(all_metrics, all_imputed_matrices)` where `all_metrics`
     contains one record per mask with a `mask_index` key.
     """
-    if num_masks <= 0:
-        raise ValueError("num_masks must be positive.")
     if artifact_mask_index < 0:
         raise ValueError("artifact_mask_index must be non-negative.")
+    selected_mask_indices = (
+        None
+        if mask_indices_to_run is None
+        else tuple(int(index) for index in mask_indices_to_run)
+    )
+    if selected_mask_indices is not None:
+        if not selected_mask_indices:
+            raise ValueError("mask_indices_to_run must not be empty when provided.")
+        if any(index < 0 for index in selected_mask_indices):
+            raise ValueError("mask_indices_to_run values must be non-negative.")
 
     base_method_kwargs = {} if method_kwargs is None else dict(method_kwargs)
     result_config_fields = _extract_scalar_fields(base_method_kwargs)
@@ -437,7 +549,6 @@ def run_i24_imputation_experiment(
     imputed_dir = output_dir / "imputed_matrices"
     imputed_dir.mkdir(parents=True, exist_ok=True)
 
-    generator = rng if isinstance(rng, np.random.Generator) else np.random.default_rng(rng)
     if mask_indices_by_file is None:
         mask_indices_by_file = build_i24_mask_index_map(
             metrics=metrics,
@@ -445,8 +556,7 @@ def run_i24_imputation_experiment(
             dt_values=dt_values,
             dx_values=dx_values,
             input_dir=input_dir,
-            num_masks=num_masks,
-            rng=generator,
+            mask_path=mask_path,
         )
 
     raw_rows: list[dict[str, Any]] = []
@@ -456,18 +566,28 @@ def run_i24_imputation_experiment(
         matrix_path = manifest_row["matrix_path"]
         ground_truth = np.load(matrix_path)
 
-        if matrix_path in mask_indices_by_file:
-            masked_matrices = apply_row_masks(
-                matrix=ground_truth,
-                mask_indices=mask_indices_by_file[matrix_path],
+        if matrix_path not in mask_indices_by_file:
+            raise ValueError(
+                f"No predefined mask indices found for '{matrix_path}'. "
+                f"Check the saved mask artifact at '{mask_path}'."
             )
+        full_mask_list = mask_indices_by_file[matrix_path]
+        if selected_mask_indices is None:
+            mask_list_for_case = full_mask_list
+            original_mask_indices = tuple(range(len(full_mask_list)))
         else:
-            masked_matrices = generate_masked_row_arrays(
-                matrix=ground_truth,
-                resolution=int(manifest_row["dx_meters"]),
-                num_masks=num_masks,
-                rng=generator,
-            )
+            if max(selected_mask_indices) >= len(full_mask_list):
+                raise ValueError(
+                    f"Requested mask index {max(selected_mask_indices)} for "
+                    f"'{matrix_path}', but only {len(full_mask_list)} masks are available."
+                )
+            mask_list_for_case = [full_mask_list[index] for index in selected_mask_indices]
+            original_mask_indices = selected_mask_indices
+
+        masked_matrices = apply_row_masks(
+            matrix=ground_truth,
+            mask_indices=mask_list_for_case,
+        )
 
         dynamic_kwargs = {} if per_matrix_kwargs_fn is None else dict(per_matrix_kwargs_fn(manifest_row))
         call_kwargs = {
@@ -483,13 +603,27 @@ def run_i24_imputation_experiment(
             raise ValueError(
                 "Expected the evaluator to return one imputed matrix per metrics record."
             )
+        if len(all_metrics) != len(original_mask_indices):
+            raise ValueError(
+                "Expected the evaluator to return one metrics record per requested mask."
+            )
 
         per_case_config = {
             **result_config_fields,
             **_extract_scalar_fields(dynamic_kwargs),
         }
 
-        for metric_record in all_metrics:
+        remapped_metrics = []
+        for metric_record, original_mask_index in zip(
+            all_metrics,
+            original_mask_indices,
+            strict=True,
+        ):
+            remapped_record = {
+                **metric_record,
+                "mask_index": int(original_mask_index),
+            }
+            remapped_metrics.append(remapped_record)
             raw_rows.append(
                 {
                     "file": manifest_row["file"],
@@ -497,17 +631,17 @@ def run_i24_imputation_experiment(
                     "metric": manifest_row["metric"],
                     "dt": manifest_row["dt"],
                     "dx_meters": int(manifest_row["dx_meters"]),
-                    **metric_record,
+                    **remapped_record,
                     **per_case_config,
                 }
             )
 
         selected_index = select_artifact_mask_index(
-            metrics_for_case=all_metrics,
+            metrics_for_case=remapped_metrics,
             artifact_mask_index=artifact_mask_index,
         )
         selected_position = next(
-            idx for idx, record in enumerate(all_metrics)
+            idx for idx, record in enumerate(remapped_metrics)
             if int(record["mask_index"]) == selected_index
         )
         imputed_matrix = np.asarray(all_imputed_matrices[selected_position], dtype=float)
@@ -658,8 +792,99 @@ def run_i24_advanced_kriging_experiment(
     )
 
 
+def run_i24_gnn_kriging_experiment(
+    method_kwargs: dict[str, Any] | None = None,
+    **experiment_kwargs: Any,
+) -> dict[str, pd.DataFrame]:
+    """
+    Convenience wrapper for STCAGCN-based GNN kriging.
+
+    The GNN evaluator uses the matrix under evaluation as the reconstruction
+    target and the companion `velocity` matrix as speed-pattern side
+    information for the adaptive graph.
+    """
+    base_method_kwargs = {} if method_kwargs is None else dict(method_kwargs)
+    user_per_matrix_kwargs_fn = experiment_kwargs.pop("per_matrix_kwargs_fn", None)
+    input_dir = experiment_kwargs.get("input_dir", I24_REPAIRED_MATRIX_DIR)
+    results_root = experiment_kwargs.get("results_root", "results")
+    base_method_kwargs.setdefault(
+        "training_history_output_dir",
+        str(Path(results_root) / "gnn_kriging" / "training_loss"),
+    )
+
+    def _inject_velocity_matrix(row: pd.Series) -> dict[str, Any]:
+        velocity_path = _find_i24_metric_matrix_path(
+            row,
+            metric="velocity",
+            input_dir=input_dir,
+        )
+        kwargs = {
+            "velocity_matrix": np.load(velocity_path),
+            "training_history_prefix": Path(str(row["file"])).stem,
+        }
+        if base_method_kwargs.get("mask_fraction") is None:
+            kwargs["mask_fraction"] = ROW_MASK_FRACTIONS_BY_RESOLUTION[
+                int(row["dx_meters"])
+            ]
+        if user_per_matrix_kwargs_fn is not None:
+            kwargs.update(user_per_matrix_kwargs_fn(row))
+        return kwargs
+
+    return run_i24_imputation_experiment(
+        method_name="gnn_kriging",
+        evaluate_on_masks_fn=evaluate_gnn_kriging_on_masks,
+        method_kwargs=base_method_kwargs,
+        per_matrix_kwargs_fn=_inject_velocity_matrix,
+        **experiment_kwargs,
+    )
+
+
+def run_i24_gnn_no_spam_experiment(
+    method_kwargs: dict[str, Any] | None = None,
+    **experiment_kwargs: Any,
+) -> dict[str, pd.DataFrame]:
+    """
+    Convenience wrapper for the STCAGCN ablation without SPAM/velocity input.
+
+    This uses the same static chain adjacency and target-row holdout protocol as
+    the main GNN experiment, but disables adaptive speed-pattern adjacency and
+    does not pass velocity data to training or inference.
+    """
+    base_method_kwargs = {"use_spam": False}
+    if method_kwargs is not None:
+        base_method_kwargs.update(method_kwargs)
+
+    user_per_matrix_kwargs_fn = experiment_kwargs.pop("per_matrix_kwargs_fn", None)
+    results_root = experiment_kwargs.get("results_root", "results")
+    base_method_kwargs.setdefault(
+        "training_history_output_dir",
+        str(Path(results_root) / "gnn_no_spam" / "training_loss"),
+    )
+
+    def _inject_no_spam_schema(row: pd.Series) -> dict[str, Any]:
+        kwargs = {
+            "training_history_prefix": Path(str(row["file"])).stem,
+        }
+        if base_method_kwargs.get("mask_fraction") is None:
+            kwargs["mask_fraction"] = ROW_MASK_FRACTIONS_BY_RESOLUTION[
+                int(row["dx_meters"])
+            ]
+        if user_per_matrix_kwargs_fn is not None:
+            kwargs.update(user_per_matrix_kwargs_fn(row))
+        return kwargs
+
+    return run_i24_imputation_experiment(
+        method_name="gnn_no_spam",
+        evaluate_on_masks_fn=evaluate_gnn_kriging_on_masks,
+        method_kwargs=base_method_kwargs,
+        per_matrix_kwargs_fn=_inject_no_spam_schema,
+        **experiment_kwargs,
+    )
+
+
 def run_i24_asm_experiment(
     method_kwargs: dict[str, Any] | None = None,
+    scale_delta_tau_to_resolution: bool = False,
     **experiment_kwargs: Any,
 ) -> dict[str, pd.DataFrame]:
     """
@@ -672,10 +897,16 @@ def run_i24_asm_experiment(
     - `dx_meters` -> `dx` in miles
     - `dt` labels like `10s`, `1min` -> `dt` in seconds
 
-    The default experiment scope is velocity only because ASM reconstructs
-    speeds, not flow or density.
+    Set `scale_delta_tau_to_resolution=True` to use `delta=dx_miles` and
+    `tau=dt_seconds` for each matrix, i.e. smoothing scales of one neighboring
+    cell in space and time.
     """
-    base_method_kwargs = {**DEFAULT_ASM_PARAMS}
+    base_method_kwargs = {
+        **DEFAULT_ASM_PARAMS,
+        # I-24 westbound matrices are indexed by increasing postmile, while ASM's
+        # wave-speed convention is easier to interpret on the downstream axis.
+        "space_axis_sign": -1,
+    }
     if method_kwargs is not None:
         base_method_kwargs.update(method_kwargs)
 
@@ -683,10 +914,19 @@ def run_i24_asm_experiment(
     experiment_kwargs.setdefault("metrics", ("velocity",))
 
     def _inject_asm_schema(row: pd.Series) -> dict[str, Any]:
+        dx_miles = float(row["dx_meters"]) / METERS_PER_MILE
+        dt_seconds = _parse_dt_label_to_seconds(str(row["dt"]))
         kwargs = {
-            "dx_miles": float(row["dx_meters"]) / METERS_PER_MILE,
-            "dt_seconds": _parse_dt_label_to_seconds(str(row["dt"])),
+            "dx_miles": dx_miles,
+            "dt_seconds": dt_seconds,
         }
+        if scale_delta_tau_to_resolution:
+            kwargs.update(
+                {
+                    "delta": dx_miles,
+                    "tau": dt_seconds,
+                }
+            )
         if user_per_matrix_kwargs_fn is not None:
             kwargs.update(user_per_matrix_kwargs_fn(row))
         return kwargs
@@ -696,5 +936,350 @@ def run_i24_asm_experiment(
         evaluate_on_masks_fn=evaluate_asm_on_masks,
         method_kwargs=base_method_kwargs,
         per_matrix_kwargs_fn=_inject_asm_schema,
+        **experiment_kwargs,
+    )
+
+
+def plot_i24_imputation_summary_matrices(
+    summary_results: pd.DataFrame | str | Path,
+    output_dir: str | Path | None = None,
+    score_names: tuple[str, ...] = ("mae", "mape", "rmse"),
+    metrics: tuple[str, ...] | None = None,
+    method_name: str | None = None,
+    value_suffix: str = "_mean",
+    cmap: str = "viridis",
+    annotate: bool = True,
+    figsize: tuple[float, float] = (7.0, 4.5),
+) -> dict[tuple[str, str], Any]:
+    """
+    Plot resolution-sweep heatmaps from an imputation `summary_results` table.
+
+    Rows are temporal resolutions (`dt`), columns are spatial resolutions
+    (`dx_meters`), and values are score columns such as `mae_mean`.
+    """
+    import matplotlib.pyplot as plt
+
+    if isinstance(summary_results, (str, Path)):
+        summary_df = pd.read_csv(summary_results)
+    else:
+        summary_df = summary_results.copy()
+
+    if summary_df.empty:
+        raise ValueError("summary_results is empty.")
+
+    selected_metrics = (
+        tuple(metrics)
+        if metrics is not None
+        else tuple(summary_df["metric"].drop_duplicates())
+    )
+    output_path = None if output_dir is None else Path(output_dir)
+    if output_path is not None:
+        output_path.mkdir(parents=True, exist_ok=True)
+
+    figures: dict[tuple[str, str], Any] = {}
+    dt_order = ["10s", "30s", "1min", "5min"]
+
+    for metric in selected_metrics:
+        metric_df = summary_df[summary_df["metric"] == metric]
+        if metric_df.empty:
+            continue
+
+        for score_name in score_names:
+            value_column = f"{score_name}{value_suffix}"
+            if value_column not in metric_df.columns:
+                raise ValueError(
+                    f"Missing score column '{value_column}' in summary_results."
+                )
+
+            matrix = (
+                metric_df.pivot(
+                    index="dt",
+                    columns="dx_meters",
+                    values=value_column,
+                )
+                .reindex([dt for dt in dt_order if dt in set(metric_df["dt"])])
+                .sort_index(axis=1)
+            )
+
+            fig, ax = plt.subplots(figsize=figsize)
+            image = ax.imshow(matrix.values, aspect="auto", cmap=cmap)
+            ax.set_title(
+                f"{method_name or 'imputation'} {metric} {score_name.upper()}"
+            )
+            ax.set_xlabel("Spatial resolution (m)")
+            ax.set_ylabel("Temporal resolution")
+            ax.set_xticks(np.arange(matrix.shape[1]))
+            ax.set_xticklabels(matrix.columns.astype(int))
+            ax.set_yticks(np.arange(matrix.shape[0]))
+            ax.set_yticklabels(matrix.index.astype(str))
+            fig.colorbar(image, ax=ax, label=value_column)
+
+            if annotate:
+                finite_values = matrix.values[np.isfinite(matrix.values)]
+                threshold = (
+                    float(np.nanmin(finite_values) + np.nanmax(finite_values)) / 2.0
+                    if finite_values.size
+                    else 0.0
+                )
+                for row_idx in range(matrix.shape[0]):
+                    for col_idx in range(matrix.shape[1]):
+                        value = matrix.iat[row_idx, col_idx]
+                        if np.isfinite(value):
+                            color = "white" if value > threshold else "black"
+                            ax.text(
+                                col_idx,
+                                row_idx,
+                                f"{value:.2g}",
+                                ha="center",
+                                va="center",
+                                color=color,
+                                fontsize=8,
+                            )
+
+            fig.tight_layout()
+            figures[(metric, score_name)] = fig
+
+            if output_path is not None:
+                method_prefix = f"{method_name}_" if method_name else ""
+                fig.savefig(
+                    output_path / f"{method_prefix}{metric}_{score_name}_heatmap.png",
+                    dpi=200,
+                    bbox_inches="tight",
+                )
+
+    return figures
+
+
+def plot_i24_imputed_matrix_artifacts(
+    artifact_manifest: pd.DataFrame | str | Path,
+    mask_indices_by_file: dict[str, list[np.ndarray]] | None = None,
+    input_dir: str = I24_REPAIRED_MATRIX_DIR,
+    output_dir: str | Path | None = None,
+    mask_path: str | Path = DEFAULT_I24_MASK_INDEX_PATH,
+    metrics: tuple[str, ...] | None = None,
+    day_names: tuple[str, ...] | None = None,
+    dt_values: tuple[str, ...] | None = None,
+    dx_values: tuple[int, ...] | None = None,
+    max_figures: int | None = None,
+    include_error: bool = False,
+) -> dict[str, Any]:
+    """
+    Plot original, masked, and reconstructed matrices from saved imputation artifacts.
+
+    If `mask_indices_by_file` is not passed, masks are loaded from the
+    predefined mask artifact at `mask_path`.
+    """
+    import matplotlib.pyplot as plt
+    from data_utils import (
+        _format_dt_resolution_label,
+        _format_dx_resolution_label,
+        _get_i24_plot_bounds,
+        _get_i24_time_bounds,
+        _plot_matrix_on_ax,
+    )
+
+    if isinstance(artifact_manifest, (str, Path)):
+        artifact_df = pd.read_csv(artifact_manifest)
+    else:
+        artifact_df = artifact_manifest.copy()
+
+    if artifact_df.empty:
+        raise ValueError("artifact_manifest is empty.")
+
+    if metrics is not None:
+        artifact_df = artifact_df[artifact_df["metric"].isin(metrics)]
+    if day_names is not None:
+        artifact_df = artifact_df[artifact_df["day"].isin(day_names)]
+    if dt_values is not None:
+        artifact_df = artifact_df[artifact_df["dt"].isin(dt_values)]
+    if dx_values is not None:
+        artifact_df = artifact_df[artifact_df["dx_meters"].astype(int).isin(dx_values)]
+    artifact_df = artifact_df.reset_index(drop=True)
+
+    if artifact_df.empty:
+        raise ValueError("No artifact rows remain after filtering.")
+
+    if mask_indices_by_file is None:
+        mask_indices_by_file = build_i24_mask_index_map(
+            metrics=tuple(artifact_df["metric"].drop_duplicates()),
+            day_names=tuple(artifact_df["day"].drop_duplicates()),
+            dt_values=tuple(artifact_df["dt"].drop_duplicates()),
+            dx_values=tuple(int(value) for value in artifact_df["dx_meters"].drop_duplicates()),
+            input_dir=input_dir,
+            mask_path=mask_path,
+        )
+
+    output_path = None if output_dir is None else Path(output_dir)
+    if output_path is not None:
+        output_path.mkdir(parents=True, exist_ok=True)
+
+    rows_to_plot = artifact_df
+    if max_figures is not None:
+        rows_to_plot = rows_to_plot.head(max_figures)
+
+    figures: dict[str, Any] = {}
+    for _, row in rows_to_plot.iterrows():
+        matrix_path = str(row["matrix_path"])
+        ground_truth = np.load(matrix_path)
+        imputed = np.load(row["artifact_path"])
+        artifact_mask_index = int(row["artifact_mask_index"])
+
+        if matrix_path not in mask_indices_by_file:
+            raise ValueError(f"No mask indices found for '{matrix_path}'.")
+        mask_list = mask_indices_by_file[matrix_path]
+        if artifact_mask_index >= len(mask_list):
+            raise ValueError(
+                f"artifact_mask_index={artifact_mask_index} is not available for "
+                f"'{matrix_path}'."
+            )
+
+        masked = apply_row_masks(ground_truth, [mask_list[artifact_mask_index]])[0]
+        error = imputed - ground_truth
+
+        panels = [
+            ("Original", ground_truth, None),
+            ("Masked", masked, None),
+            ("Reconstructed", imputed, None),
+        ]
+        if include_error:
+            max_abs_error = float(np.nanmax(np.abs(error)))
+            panels.append(("Reconstruction Error", error, (-max_abs_error, max_abs_error)))
+
+        finite_values = np.concatenate(
+            [
+                np.asarray(matrix, dtype=float)[np.isfinite(matrix)]
+                for _, matrix, colorbar_range in panels
+                if colorbar_range is None and np.any(np.isfinite(matrix))
+            ]
+        )
+        shared_range = (
+            (float(np.nanmin(finite_values)), float(np.nanmax(finite_values)))
+            if finite_values.size
+            else None
+        )
+
+        fig, axes = plt.subplots(
+            1,
+            len(panels),
+            figsize=(5.2 * len(panels), 4.5),
+            constrained_layout=True,
+        )
+        axes = np.atleast_1d(axes)
+
+        dx_meters = int(row["dx_meters"])
+        t_min, t_max = _get_i24_time_bounds()
+        start_pm, end_pm = _get_i24_plot_bounds(dx_meters)
+        time_resolution_label = _format_dt_resolution_label(str(row["dt"]))
+        space_resolution_label = _format_dx_resolution_label(dx_meters)
+
+        last_pcm = None
+        for ax, (panel_title, matrix, panel_range) in zip(axes, panels, strict=True):
+            colorbar_range = panel_range if panel_range is not None else shared_range
+            last_pcm = _plot_matrix_on_ax(
+                ax=ax,
+                matrix=matrix,
+                title=panel_title,
+                colorbar_label=str(row["metric"]),
+                colorbar_range=colorbar_range,
+                t_min=t_min,
+                t_max=t_max,
+                start_pm=start_pm,
+                end_pm=end_pm,
+                add_colorbar=False,
+                show_ylabel=ax is axes[0],
+                title_prefix="",
+                time_resolution_label=time_resolution_label,
+                space_resolution_label=space_resolution_label,
+            )
+
+        if last_pcm is not None:
+            fig.colorbar(last_pcm, ax=axes.ravel().tolist(), shrink=0.85)
+
+        figure_key = (
+            f"{row['method']}_{row['day']}_{row['metric']}_dt_{row['dt']}"
+            f"_dx_{dx_meters}m_mask_{artifact_mask_index}"
+        )
+        fig.suptitle(figure_key)
+        figures[figure_key] = fig
+
+        if output_path is not None:
+            fig.savefig(
+                output_path / f"{figure_key}.png",
+                dpi=200,
+                bbox_inches="tight",
+            )
+            plt.close(fig)
+        elif plt.get_backend().lower() != "agg":
+            plt.show()
+
+    return figures
+
+
+def run_i24_metanet_experiment(
+    method_kwargs: dict[str, Any] | None = None,
+    **experiment_kwargs: Any,
+) -> dict[str, pd.DataFrame]:
+    """
+    Convenience wrapper for METANET physics-based imputation.
+
+    METANET calibrates on total flow and speed, so companion `flow` and
+    `velocity` matrices are loaded for every evaluated metric. The default
+    experiment scope is `velocity`, `flow`, and `density`; `flow_per_lane` is
+    also supported when explicitly requested.
+    """
+    base_method_kwargs = {} if method_kwargs is None else dict(method_kwargs)
+    user_per_matrix_kwargs_fn = experiment_kwargs.pop("per_matrix_kwargs_fn", None)
+    input_dir = experiment_kwargs.get("input_dir", I24_REPAIRED_MATRIX_DIR)
+    metrics = tuple(experiment_kwargs.get("metrics", ("velocity", "flow", "density")))
+    experiment_kwargs["metrics"] = metrics
+    calibration_cache = base_method_kwargs.setdefault("calibration_cache", {})
+
+    required_mask_metrics = tuple(dict.fromkeys((*metrics, "flow", "velocity")))
+    if experiment_kwargs.get("mask_indices_by_file") is None:
+        experiment_kwargs["mask_indices_by_file"] = build_i24_mask_index_map(
+            metrics=required_mask_metrics,
+            day_names=experiment_kwargs.get("day_names"),
+            dt_values=experiment_kwargs.get("dt_values"),
+            dx_values=experiment_kwargs.get("dx_values"),
+            input_dir=input_dir,
+            mask_path=experiment_kwargs.get("mask_path", DEFAULT_I24_MASK_INDEX_PATH),
+        )
+
+    def _inject_metanet_schema(row: pd.Series) -> dict[str, Any]:
+        flow_path = _find_i24_metric_matrix_path(
+            row,
+            metric="flow",
+            input_dir=input_dir,
+        )
+        velocity_path = _find_i24_metric_matrix_path(
+            row,
+            metric="velocity",
+            input_dir=input_dir,
+        )
+        kwargs = {
+            "metric": str(row["metric"]),
+            "dx_meters": int(row["dx_meters"]),
+            "dt_seconds": _parse_dt_label_to_seconds(str(row["dt"])),
+            "total_flow_matrix": np.load(flow_path),
+            "velocity_matrix": np.load(velocity_path),
+            "case_key": (
+                row["day"],
+                row["direction"],
+                row["start_label"],
+                row["end_label"],
+                row["dt"],
+                int(row["dx_meters"]),
+            ),
+            "calibration_cache": calibration_cache,
+        }
+        if user_per_matrix_kwargs_fn is not None:
+            kwargs.update(user_per_matrix_kwargs_fn(row))
+        return kwargs
+
+    return run_i24_imputation_experiment(
+        method_name="metanet",
+        evaluate_on_masks_fn=evaluate_metanet_on_masks,
+        method_kwargs=base_method_kwargs,
+        per_matrix_kwargs_fn=_inject_metanet_schema,
         **experiment_kwargs,
     )

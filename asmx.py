@@ -96,6 +96,41 @@ def fft_four_convs(Dp, Mp, k_cong, k_free, eps=1e-6, use_ortho=True):
     return sum_cong, N_cong, sum_free, N_free
 
 
+def _resolve_space_axis_sign(space_axis_sign: int | float | str) -> float:
+    """
+    Resolve the sign convention for the ASM space axis.
+
+    `1` means matrix row index increases in the positive physical x direction.
+    `-1` means matrix row index increases opposite to the positive physical x
+    direction, which flips the sign of the wave speeds in row coordinates.
+    """
+    if isinstance(space_axis_sign, str):
+        normalized = space_axis_sign.strip().lower()
+        aliases = {
+            "row_increases_with_x": 1.0,
+            "postmile": 1.0,
+            "milepost": 1.0,
+            "same": 1.0,
+            "normal": 1.0,
+            "row_decreases_with_x": -1.0,
+            "reverse": -1.0,
+            "reversed": -1.0,
+            "flip": -1.0,
+            "flipped": -1.0,
+        }
+        if normalized not in aliases:
+            raise ValueError(
+                "space_axis_sign must be 1, -1, or a known alias such as "
+                "'same' or 'reverse'."
+            )
+        return aliases[normalized]
+
+    sign = float(space_axis_sign)
+    if sign not in {-1.0, 1.0}:
+        raise ValueError("space_axis_sign must be either 1 or -1.")
+    return sign
+
+
 class AdaptiveSmoothing(nn.Module):
     """
     ASMx: Adaptive Smoothing Method for Traffic State Estimation.
@@ -127,25 +162,27 @@ class AdaptiveSmoothing(nn.Module):
                  init_c_cong: float = 12.26,
                  init_c_free: float = -50.40,
                  init_v_thr: float = 49.57,
-                 init_v_delta: float = 10.11):
+                 init_v_delta: float = 10.11,
+                 space_axis_sign: int | float | str = 1):
         super().__init__()
         self.size_t = int(kernel_time_window / dt)
         self.size_x = int(kernel_space_window / dx)
         self.dt = dt
         self.dx = dx
+        self.space_axis_sign = _resolve_space_axis_sign(space_axis_sign)
 
         t_offs = torch.arange(-self.size_t, self.size_t + 1) * dt
-        x_offs = torch.arange(-self.size_x, self.size_x + 1) * dx
+        x_offs = torch.arange(-self.size_x, self.size_x + 1) * dx * self.space_axis_sign
         X, T = torch.meshgrid(x_offs, t_offs, indexing='ij')
         self.register_buffer('T_offsets', T.float())
         self.register_buffer('X_offsets', X.float())
 
-        self.delta   = nn.Parameter(torch.tensor(init_delta))
-        self.tau     = nn.Parameter(torch.tensor(init_tau))
-        self.c_cong  = nn.Parameter(torch.tensor(init_c_cong))
-        self.c_free  = nn.Parameter(torch.tensor(init_c_free))
-        self.v_thr   = nn.Parameter(torch.tensor(init_v_thr))
-        self.v_delta = nn.Parameter(torch.tensor(init_v_delta))
+        self.delta   = nn.Parameter(torch.tensor(init_delta, dtype=torch.float32))
+        self.tau     = nn.Parameter(torch.tensor(init_tau, dtype=torch.float32))
+        self.c_cong  = nn.Parameter(torch.tensor(init_c_cong, dtype=torch.float32))
+        self.c_free  = nn.Parameter(torch.tensor(init_c_free, dtype=torch.float32))
+        self.v_thr   = nn.Parameter(torch.tensor(init_v_thr, dtype=torch.float32))
+        self.v_delta = nn.Parameter(torch.tensor(init_v_delta, dtype=torch.float32))
 
     def forward(self, raw_data: torch.Tensor):
         """
@@ -206,7 +243,9 @@ def run_asmx(speed_matrix, dx, dt, delta, tau,
              v_thr=DEFAULT_ASM_PARAMS["v_thr"],
              v_delta=DEFAULT_ASM_PARAMS["v_delta"],
              min_value: float | None = 0.0,
-             max_value: float | None = None):
+             max_value: float | None = None,
+             preserve_observed: bool = False,
+             space_axis_sign: int | float | str = 1):
     """
     Convenience wrapper: run ASMx on a numpy speed matrix.
 
@@ -241,7 +280,8 @@ def run_asmx(speed_matrix, dx, dt, delta, tau,
         dx=dx, dt=dt,
         init_delta=delta, init_tau=tau,
         init_c_cong=c_cong, init_c_free=c_free,
-        init_v_thr=v_thr, init_v_delta=v_delta
+        init_v_thr=v_thr, init_v_delta=v_delta,
+        space_axis_sign=space_axis_sign,
     )
     model.eval()
 
@@ -249,9 +289,12 @@ def run_asmx(speed_matrix, dx, dt, delta, tau,
     raw_tensor = torch.from_numpy(speed_matrix).float()
     with torch.no_grad():
         smoothed = model(raw_tensor)
-    imputed = smoothed[0].cpu().numpy()
+    imputed = smoothed[0].cpu().numpy().astype(speed_matrix.dtype, copy=False)
     if min_value is not None or max_value is not None:
         imputed = np.clip(imputed, min_value, max_value)
+    if preserve_observed:
+        observed = np.isfinite(speed_matrix)
+        imputed[observed] = speed_matrix[observed]
     return imputed
 
 
@@ -267,6 +310,8 @@ def asm_impute(
     v_delta: float = DEFAULT_ASM_PARAMS["v_delta"],
     min_value: float | None = 0.0,
     max_value: float | None = None,
+    preserve_observed: bool = True,
+    space_axis_sign: int | float | str = 1,
 ) -> np.ndarray:
     """
     Impute a `(space, time)` speed matrix with ASM.
@@ -286,6 +331,8 @@ def asm_impute(
         v_delta=v_delta,
         min_value=min_value,
         max_value=max_value,
+        preserve_observed=preserve_observed,
+        space_axis_sign=space_axis_sign,
     )
 
 
@@ -304,6 +351,8 @@ def evaluate_asm(
     v_delta: float = DEFAULT_ASM_PARAMS["v_delta"],
     min_value: float | None = 0.0,
     max_value: float | None = None,
+    preserve_observed: bool = True,
+    space_axis_sign: int | float | str = 1,
     return_imputed_matrix: bool = False,
 ) -> dict[str, float] | tuple[dict[str, float], np.ndarray]:
     """Run ASM on one masked speed matrix and score experimentally hidden cells."""
@@ -325,6 +374,8 @@ def evaluate_asm(
         v_delta=v_delta,
         min_value=min_value,
         max_value=max_value,
+        preserve_observed=preserve_observed,
+        space_axis_sign=space_axis_sign,
     )
 
     metrics = {
@@ -353,6 +404,8 @@ def evaluate_asm_on_masks(
     v_delta: float = DEFAULT_ASM_PARAMS["v_delta"],
     min_value: float | None = 0.0,
     max_value: float | None = None,
+    preserve_observed: bool = True,
+    space_axis_sign: int | float | str = 1,
     return_imputed_matrices: bool = False,
 ) -> list[dict[str, float]] | tuple[list[dict[str, float]], list[np.ndarray]]:
     """Run and score ASM over a collection of masked speed matrices."""
@@ -379,6 +432,8 @@ def evaluate_asm_on_masks(
             v_delta=v_delta,
             min_value=min_value,
             max_value=max_value,
+            preserve_observed=preserve_observed,
+            space_axis_sign=space_axis_sign,
             return_imputed_matrix=return_imputed_matrices,
         )
 

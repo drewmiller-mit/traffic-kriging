@@ -1840,19 +1840,21 @@ def plot_i24_figure_3_flow_per_lane_masking_grid(
     day_name="nov21",
     dt_label="10s",
     dx_values=(200, 400, 600, 800),
-    num_masks=5,
-    rng=None,
     mask_indices_by_dx=None,
     input_dir="data/i24/matrix_sweeps/daily_combined_repaired",
     space_bin_csv_dir="data/i24/matrix_sweeps/daily_combined_repaired/space_bin_csvs",
     output_path=None,
 ):
-    """Figure 3: grid of random masked flow-per-lane matrices across spatial resolutions."""
-    from methods import apply_row_masks, generate_masked_row_arrays
+    """Figure 3: grid of predefined masked flow-per-lane matrices across spatial resolutions."""
+    from methods import apply_row_masks
+
+    if mask_indices_by_dx is None:
+        raise ValueError("mask_indices_by_dx is required; masks are no longer generated in plotting.")
 
     t_min, t_max = _get_i24_time_bounds(start_label="0630", end_label="1000")
     masked_by_dx = {}
     finite_values = []
+    num_masks = None
 
     for dx_meters in dx_values:
         matrix, _ = _load_i24_repaired_matrix(
@@ -1862,17 +1864,11 @@ def plot_i24_figure_3_flow_per_lane_masking_grid(
             dx_meters=dx_meters,
             input_dir=input_dir,
         )
-        if mask_indices_by_dx is not None:
-            if dx_meters not in mask_indices_by_dx:
-                raise KeyError(f"mask_indices_by_dx is missing resolution {dx_meters}m.")
-            masked_matrices = apply_row_masks(matrix, mask_indices_by_dx[dx_meters])
-        else:
-            masked_matrices = generate_masked_row_arrays(
-                matrix=matrix,
-                resolution=dx_meters,
-                num_masks=num_masks,
-                rng=rng,
-            )
+        if dx_meters not in mask_indices_by_dx:
+            raise KeyError(f"mask_indices_by_dx is missing resolution {dx_meters}m.")
+        masked_matrices = apply_row_masks(matrix, mask_indices_by_dx[dx_meters])
+        if num_masks is None:
+            num_masks = len(masked_matrices)
         if len(masked_matrices) != num_masks:
             raise ValueError(
                 f"Expected {num_masks} masked matrices for {dx_meters}m, got {len(masked_matrices)}."
@@ -1883,6 +1879,8 @@ def plot_i24_figure_3_flow_per_lane_masking_grid(
 
     stacked = np.concatenate(finite_values)
     colorbar_range = (float(np.nanmin(stacked)), float(np.nanmax(stacked)))
+    if num_masks is None:
+        raise ValueError("No masks were supplied.")
 
     fig, axes = plt.subplots(
         num_masks,

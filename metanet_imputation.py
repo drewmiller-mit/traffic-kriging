@@ -9,6 +9,8 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 
+from methods import apply_row_masks, masked_mae, masked_mape, masked_rmse
+
 
 KILOMETERS_PER_MILE = 1.609344
 SEGMENT_MAPPING_DIR = Path("data/i24/segment_mappings")
@@ -17,6 +19,7 @@ SEGMENT_MAPPING_MANIFEST = SEGMENT_MAPPING_DIR / "segment_mapping_manifest.csv"
 
 MatrixOrientation = Literal["space_time", "time_space"]
 VelocityUnits = Literal["mph", "kmh"]
+MetanetMetric = Literal["flow", "density", "velocity", "flow_per_lane"]
 
 
 @dataclass(frozen=True)
@@ -259,3 +262,167 @@ def run_metanet_calibration_on_matrices(
         **kwargs,
     )
     return results, prepared
+
+
+def _masked_row_indices(masked_matrix: np.ndarray) -> list[np.ndarray]:
+    masked_rows = np.flatnonzero(np.isnan(masked_matrix).all(axis=1)).astype(int)
+    return [masked_rows]
+
+
+def _require_companion_matrix(
+    matrix: np.ndarray | None,
+    *,
+    name: str,
+) -> np.ndarray:
+    if matrix is None:
+        raise ValueError(f"`{name}` is required for METANET imputation.")
+    arr = np.asarray(matrix, dtype=float)
+    if arr.ndim != 2:
+        raise ValueError(f"{name} must be 2D; got shape {arr.shape}.")
+    return arr
+
+
+def _build_metanet_imputed_matrix(
+    results: dict,
+    masked_matrix: np.ndarray,
+    *,
+    metric: MetanetMetric,
+    lane_mapping: np.ndarray,
+    velocity_units: VelocityUnits,
+) -> np.ndarray:
+    imputed = np.asarray(masked_matrix, dtype=float).copy()
+    interior = slice(1, imputed.shape[0] - 1)
+    velocity_space_time = np.asarray(results["v_pred"], dtype=float).T
+    density_space_time = np.asarray(results["rho_pred"], dtype=float).T
+    flow_space_time = density_space_time * velocity_space_time
+
+    if metric == "velocity":
+        if velocity_units == "mph":
+            imputed[interior, :] = velocity_space_time / KILOMETERS_PER_MILE
+        else:
+            imputed[interior, :] = velocity_space_time
+    elif metric == "flow":
+        imputed[interior, :] = flow_space_time
+    elif metric == "density":
+        imputed[interior, :] = density_space_time * KILOMETERS_PER_MILE
+    elif metric == "flow_per_lane":
+        lanes = np.asarray(lane_mapping[1:-1], dtype=float)[:, np.newaxis]
+        imputed[interior, :] = flow_space_time / lanes
+    else:
+        raise ValueError(
+            "metric must be one of 'flow', 'density', 'velocity', or 'flow_per_lane'."
+        )
+    return imputed
+
+
+def evaluate_metanet_on_masks(
+    ground_truth: np.ndarray,
+    masked_matrices: list[np.ndarray],
+    *,
+    metric: MetanetMetric,
+    dx_meters: int,
+    dt_seconds: float | None = None,
+    dt_label: str | None = None,
+    total_flow_matrix: np.ndarray | None = None,
+    velocity_matrix: np.ndarray | None = None,
+    velocity_units: VelocityUnits = "mph",
+    mapping_dir: str | Path = SEGMENT_MAPPING_DIR,
+    calibration_kwargs: dict | None = None,
+    calibration_cache: dict | None = None,
+    case_key: object | None = None,
+    return_imputed_matrices: bool = False,
+) -> list[dict[str, float]] | tuple[list[dict[str, float]], list[np.ndarray]]:
+    """
+    Run METANET calibration over row-masked matrices and score one output metric.
+
+    Companion flow/velocity matrices are masked with the same row indices as the
+    evaluated matrix before calibration. Boundary rows cannot be masked because
+    `run_calibration` uses the first and last rows as upstream/downstream
+    boundary conditions and only predicts interior segments.
+    """
+    all_metrics = []
+    all_imputed = []
+    ground_truth = np.asarray(ground_truth, dtype=float)
+    flow_ground_truth = _require_companion_matrix(
+        ground_truth if metric == "flow" else total_flow_matrix,
+        name="total_flow_matrix",
+    )
+    velocity_ground_truth = _require_companion_matrix(
+        ground_truth if metric == "velocity" else velocity_matrix,
+        name="velocity_matrix",
+    )
+    if flow_ground_truth.shape != velocity_ground_truth.shape:
+        raise ValueError(
+            "total_flow_matrix and velocity_matrix must have matching shapes; "
+            f"got {flow_ground_truth.shape} and {velocity_ground_truth.shape}."
+        )
+    if ground_truth.shape != flow_ground_truth.shape:
+        raise ValueError(
+            "ground_truth must match METANET companion matrix shapes; "
+            f"got {ground_truth.shape} and {flow_ground_truth.shape}."
+        )
+
+    for mask_idx, masked_matrix in enumerate(masked_matrices):
+        masked_matrix = np.asarray(masked_matrix, dtype=float)
+        mask_rows = _masked_row_indices(masked_matrix)[0]
+        if mask_rows.size and (0 in mask_rows or masked_matrix.shape[0] - 1 in mask_rows):
+            raise ValueError(
+                "METANET experiments require unmasked first/last boundary rows. "
+                f"Received masked boundary rows {mask_rows.tolist()}."
+            )
+
+        if metric == "flow":
+            masked_flow = masked_matrix
+        else:
+            masked_flow = apply_row_masks(flow_ground_truth, [mask_rows])[0]
+
+        if metric == "velocity":
+            masked_velocity = masked_matrix
+        else:
+            masked_velocity = apply_row_masks(velocity_ground_truth, [mask_rows])[0]
+
+        cache_key = None
+        if calibration_cache is not None:
+            resolved_case_key = (
+                case_key
+                if case_key is not None
+                else (dx_meters, dt_seconds, dt_label, flow_ground_truth.shape)
+            )
+            cache_key = (resolved_case_key, tuple(mask_rows.tolist()))
+
+        if cache_key is not None and cache_key in calibration_cache:
+            results, prepared = calibration_cache[cache_key]
+        else:
+            results, prepared = run_metanet_calibration_on_matrices(
+                total_flow_matrix=masked_flow,
+                avg_velocity_matrix=masked_velocity,
+                dx_meters=dx_meters,
+                dt_seconds=dt_seconds,
+                dt_label=dt_label,
+                velocity_units=velocity_units,
+                mapping_dir=mapping_dir,
+                calibration_kwargs=calibration_kwargs,
+            )
+            if cache_key is not None:
+                calibration_cache[cache_key] = (results, prepared)
+
+        imputed_matrix = _build_metanet_imputed_matrix(
+            results,
+            masked_matrix,
+            metric=metric,
+            lane_mapping=prepared.lane_mapping,
+            velocity_units=velocity_units,
+        )
+        metrics = {
+            "mask_index": int(mask_idx),
+            "mae": masked_mae(ground_truth, imputed_matrix, masked_matrix),
+            "mape": masked_mape(ground_truth, imputed_matrix, masked_matrix),
+            "rmse": masked_rmse(ground_truth, imputed_matrix, masked_matrix),
+        }
+        all_metrics.append(metrics)
+        if return_imputed_matrices:
+            all_imputed.append(imputed_matrix)
+
+    if return_imputed_matrices:
+        return all_metrics, all_imputed
+    return all_metrics
